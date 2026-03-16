@@ -23,10 +23,12 @@ Real-time shoplifting detection using YOLOv8-Pose. Detects suspicious body movem
 | Hand moves reach → bag zone | +40 |
 | Repeated reach gestures (3+) | +20 |
 | Abnormal fast wrist motion | +30 |
-| Both hands in suspicious zones | +20 |
-| Loitering in same spot (3+ sec) | +15 |
+| Both hands in suspicious zones simultaneously | +20 |
+| Loitering in same spot (~3 sec) | +15 |
 
 Alert triggers at score **60/100**
+
+> Note: Both hands are scored independently and summed (capped at 80), then bonuses are added on top.
 
 ---
 
@@ -35,11 +37,11 @@ Alert triggers at score **60/100**
 ```
 ┌──────────────┐  0%   top of person
 │  HEAD ZONE   │
-├──────────────┤  22%
+├──────────────┤  20%
 │  REACH ZONE  │  ← arms reaching for items
-├──────────────┤  50%
+├──────────────┤  55%
 │ CONCEAL ZONE │  ← pocket / waist area
-├──────────────┤  72%
+├──────────────┤  75%
 │   BAG ZONE   │  ← hip / bag area
 └──────────────┘  100% bottom of person
 ```
@@ -133,6 +135,9 @@ All settings are in `config/parameters.py`:
 | `REACH_DWELL_FRAMES` | 5 | Frames wrist must stay in zone to count |
 | `TRACK_GRACE_FRAMES` | 20 | Frames to keep tracking after person disappears |
 | `ZONE_SMOOTH_FRAMES` | 4 | Smoothing window to reduce jitter |
+| `LOITER_FRAMES` | 90 | Frames (~3 sec) before loitering score kicks in |
+| `LOITER_MOVE_RATIO` | 0.15 | Max centroid movement ratio to count as loitering |
+| `ABNORMAL_MOTION_RATIO` | 0.08 | Wrist speed threshold relative to person height |
 
 ---
 
