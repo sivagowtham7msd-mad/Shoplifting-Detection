@@ -131,4 +131,8 @@ dmypy.json
 # Project specific
 Samples/outputs/
 *.avi
-*.mp4  # if outputs are videos, but inputs are samples
+*.mp4
+
+# Credentials — never commit these
+config/alerts.py
+.env

@@ -20,23 +20,26 @@ quit_key   = 'q'
 ALERT_SCORE_THRESHOLD  = 60   # Trigger alert when score exceeds this
 
 # Score weights
-SCORE_REACH_TO_CONCEAL = 40   # Hand moves from reach zone → conceal/pocket zone
-SCORE_REACH_TO_BAG     = 40   # Hand moves from reach zone → bag/hip zone
-SCORE_REPEATED_REACH   = 20   # Repeated reach gestures (> threshold count)
-SCORE_ABNORMAL_MOTION  = 30   # Fast erratic wrist movement
+SCORE_REACH_TO_CONCEAL = 40
+SCORE_REACH_TO_BAG     = 40
+SCORE_REPEATED_REACH   = 20
+SCORE_ABNORMAL_MOTION  = 30
+SCORE_BOTH_HANDS       = 20   # both hands in suspicious zones simultaneously
+SCORE_LOITERING        = 15   # person barely moving for extended period
 
 # ── Pose / tracking config ────────────────────────────────────────────────────
-HAND_HISTORY_FRAMES    = 60   # Rolling window of frames for hand history
-# Motion threshold as fraction of person box height (relative, not absolute px)
-# e.g. 0.08 = wrist must move >8% of person height per frame to be "abnormal"
+HAND_HISTORY_FRAMES    = 60
 ABNORMAL_MOTION_RATIO  = 0.08
-REPEATED_REACH_COUNT   = 4    # Distinct reach entries before scoring
+REPEATED_REACH_COUNT   = 3
+REACH_DWELL_FRAMES     = 5
+TRACK_GRACE_FRAMES     = 20
 
-# Min frames wrist must stay in reach zone before a reach "entry" is counted
-REACH_DWELL_FRAMES     = 6
+# Zone smoothing: majority vote over last N zone readings to reduce jitter
+ZONE_SMOOTH_FRAMES     = 4
 
-# Frames to keep a person's state alive after they disappear (handles missed detections)
-TRACK_GRACE_FRAMES     = 15
+# Loitering detection
+LOITER_FRAMES          = 90   # ~3 seconds at 30fps
+LOITER_MOVE_RATIO      = 0.15
 
 # ── Body-relative zone boundaries (fraction of person bounding box height) ───
 #
