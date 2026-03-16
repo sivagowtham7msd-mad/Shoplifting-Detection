@@ -1,0 +1,1 @@
+An AI-powered computer vision system that detects shoplifting behavior in retail environments using YOLOv8 object detection and video analysis. The system analyzes surveillance footage and identifies suspicious activities in real time. 
