@@ -1,7 +1,6 @@
 
 
 from ultralytics import YOLO
-import torch
 import numpy as np
 import imutils
 import cv2
@@ -12,24 +11,10 @@ from config.parameters import WIDTH, start_status, shoplifting_status, not_shopl
 from config.parameters import cls0_rect_color, cls1_rect_color, conf_color, status_color
 from config.parameters import quit_key, frame_name
 
-
-def load_trusted_yolo_model(weights_path):
-    original_torch_load = torch.load
-
-    def compatible_torch_load(*args, **kwargs):
-        kwargs.setdefault("weights_only", False)
-        return original_torch_load(*args, **kwargs)
-
-    torch.load = compatible_torch_load
-    try:
-        return YOLO(weights_path)
-    finally:
-        torch.load = original_torch_load
-
 input_path = "Samples/inputs/sr1.mp4"
 output_path = "Samples/outputs/sr1_output.avi"
 os.makedirs(os.path.dirname(output_path), exist_ok=True)
-mymodel = load_trusted_yolo_model("configs/shoplifting_weights.pt")
+mymodel = YOLO("configs/shoplifting_weights.pt")
 
 #For videos
 # cap = cv2.VideoCapture(input_path)
