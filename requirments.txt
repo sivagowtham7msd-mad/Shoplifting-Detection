@@ -2,4 +2,5 @@ ultralytics==8.0.136
 numpy==1.24.3
 imutils==0.5.4
 opencv-python==4.8.0.74
-mediapipe==0.10.9
+twilio==8.5.0
+pyngrok

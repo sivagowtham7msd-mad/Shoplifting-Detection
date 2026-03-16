@@ -1,9 +1,12 @@
+from alert import send_whatsapp_alert, start_ngrok
 from ultralytics import YOLO
-import mediapipe as mp
 import numpy as np
 import imutils
 import cv2
 import os
+import datetime
+import threading
+import winsound
 from collections import deque
 
 from config.parameters import (
@@ -13,101 +16,121 @@ from config.parameters import (
     ALERT_SCORE_THRESHOLD,
     SCORE_REACH_TO_CONCEAL, SCORE_REACH_TO_BAG,
     SCORE_REPEATED_REACH, SCORE_ABNORMAL_MOTION,
-    HAND_HISTORY_FRAMES, ABNORMAL_MOTION_PX, REPEATED_REACH_COUNT,
-    REACH_ZONE_TOP, REACH_ZONE_BOT,
-    CONCEAL_ZONE_TOP, CONCEAL_ZONE_BOT,
-    BAG_ZONE_TOP, BAG_ZONE_BOT,
+    HAND_HISTORY_FRAMES, ABNORMAL_MOTION_RATIO, REPEATED_REACH_COUNT,
+    REACH_DWELL_FRAMES, TRACK_GRACE_FRAMES,
+    REACH_ZONE_TOP, REACH_ZONE_BOT, CONCEAL_ZONE_BOT,
+    SNAPSHOT_DIR,
 )
 
-# ── I/O ───────────────────────────────────────────────────────────────────────
+def play_alarm():
+    """Play a beeping alarm in a background thread (non-blocking)."""
+    def _beep():
+        for _ in range(5):
+            winsound.Beep(1000, 400)  # 1000 Hz, 400ms
+            winsound.Beep(800,  300)  # 800 Hz, 300ms
+    threading.Thread(target=_beep, daemon=True).start()
+
+os.makedirs(SNAPSHOT_DIR, exist_ok=True)
+start_ngrok(SNAPSHOT_DIR)  # auto-start ngrok for image serving
 output_path = "Samples/outputs/sr1_output.avi"
 os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-# ── Models ────────────────────────────────────────────────────────────────────
-yolo_model = YOLO("configs/shoplifting_weights.pt")
-print(f"[INFO] YOLO classes: {yolo_model.names}")
+# YOLOv8-Pose: single model for person detection + 17 keypoints
+# Downloads automatically on first run (~6MB for nano)
+pose_model = YOLO("yolov8n-pose.pt")
 
-mp_pose    = mp.solutions.pose
-mp_drawing = mp.solutions.drawing_utils
-pose_model = mp_pose.Pose(
-    static_image_mode=False,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
-)
+# COCO keypoint indices
+KP_LEFT_WRIST  = 9
+KP_RIGHT_WRIST = 10
+KP_LEFT_ELBOW  = 7
+KP_RIGHT_ELBOW = 8
+VISIBILITY_THRESH = 0.5   # keypoint confidence threshold
 
-# ── Capture ───────────────────────────────────────────────────────────────────
-# Swap to local file if needed:
-# cap = cv2.VideoCapture("Samples/inputs/sr1.mp4")
+#cap = cv2.VideoCapture("Samples/inputs/sr1.mp4")
+# For RTSP stream:
 rtsp_url = "rtsp://admin:MVGBCE@10.135.113.177:554/ch1/main"
 cap = cv2.VideoCapture(rtsp_url)
 if not cap.isOpened():
-    print(f"[ERROR] Could not open stream: {rtsp_url}")
+    print("[ERROR] Could not open video source")
     exit()
 
-writer = None
+writer        = None
+person_states = {}
+next_tid      = 0
 
 
-# ── Per-person state (keyed by detection index within a frame) ────────────────
-# Each entry: deque of (wrist_x, wrist_y, zone_label)
-hand_histories   = {}   # idx -> deque(maxlen=HAND_HISTORY_FRAMES)
-reach_counts     = {}   # idx -> int  (how many reach events seen)
-suspicion_scores = {}   # idx -> float
+def iou(a, b):
+    ix1 = max(a[0], b[0]); iy1 = max(a[1], b[1])
+    ix2 = min(a[2], b[2]); iy2 = min(a[3], b[3])
+    inter = max(0, ix2 - ix1) * max(0, iy2 - iy1)
+    union = (a[2]-a[0])*(a[3]-a[1]) + (b[2]-b[0])*(b[3]-b[1]) - inter
+    return inter / union if union > 0 else 0
 
 
-def get_zone(norm_y, box_top, box_bot):
-    """Map a normalised wrist y-coordinate to a body-relative zone label."""
+def match_detections(states, new_boxes, iou_thresh=0.35):
+    matched, used_tids = {}, set()
+    unmatched = list(range(len(new_boxes)))
+    for box_idx, box in enumerate(new_boxes):
+        best_tid, best_iou = None, iou_thresh
+        for tid, state in states.items():
+            if tid in used_tids:
+                continue
+            s = iou(state['box'], box)
+            if s > best_iou:
+                best_iou, best_tid = s, tid
+        if best_tid is not None:
+            matched[best_tid] = box_idx
+            used_tids.add(best_tid)
+            unmatched.remove(box_idx)
+    return matched, unmatched
+
+
+def get_zone(wrist_y, box_top, box_bot):
     box_h = box_bot - box_top
     if box_h == 0:
         return "unknown"
-    rel = (norm_y - box_top) / box_h          # 0 = top of person, 1 = bottom
-    if rel < REACH_ZONE_TOP:
-        return "head"
-    elif rel < REACH_ZONE_BOT:
-        return "reach"
-    elif rel < CONCEAL_ZONE_BOT:
-        return "conceal"
-    else:
-        return "bag"
+    rel = (wrist_y - box_top) / box_h
+    if   rel < REACH_ZONE_TOP:   return "head"
+    elif rel < REACH_ZONE_BOT:   return "reach"
+    elif rel < CONCEAL_ZONE_BOT: return "conceal"
+    else:                        return "bag"
 
 
-def compute_suspicion(history, reach_count):
-    """
-    Analyse hand history and return a suspicion score (0-100).
-    history: deque of (x, y, zone) tuples
-    """
-    score = 0
-    zones = [z for _, _, z in history]
+def compute_suspicion(left_hist, right_hist, reach_entries, box_h):
+    abnormal_px = ABNORMAL_MOTION_RATIO * box_h
 
-    # 1. Reach → Conceal transition
-    for i in range(1, len(zones)):
-        if zones[i - 1] == "reach" and zones[i] == "conceal":
-            score += SCORE_REACH_TO_CONCEAL
-            break   # count once per window
+    def score_hand(history):
+        s = 0
+        zones = [z for _, _, z in history]
 
-    # 2. Reach → Bag transition
-    for i in range(1, len(zones)):
-        if zones[i - 1] == "reach" and zones[i] == "bag":
-            score += SCORE_REACH_TO_BAG
-            break
+        # Reach → Conceal: reach must appear within last 15 frames before conceal
+        for i in range(1, len(zones)):
+            if zones[i] == "conceal" and "reach" in zones[max(0, i-15):i]:
+                s += SCORE_REACH_TO_CONCEAL
+                break
 
-    # 3. Repeated reaching
-    if reach_count >= REPEATED_REACH_COUNT:
+        # Reach → Bag: same logic
+        for i in range(1, len(zones)):
+            if zones[i] == "bag" and "reach" in zones[max(0, i-15):i]:
+                s += SCORE_REACH_TO_BAG
+                break
+
+        # Abnormal motion relative to person height
+        coords = [(x, y) for x, y, _ in history]
+        if len(coords) >= 2:
+            disps = [np.hypot(coords[i][0]-coords[i-1][0],
+                              coords[i][1]-coords[i-1][1])
+                     for i in range(1, len(coords))]
+            if np.mean(disps) > abnormal_px:
+                s += SCORE_ABNORMAL_MOTION
+        return s
+
+    score = max(score_hand(left_hist), score_hand(right_hist))
+    if reach_entries >= REPEATED_REACH_COUNT:
         score += SCORE_REPEATED_REACH
-
-    # 4. Abnormal / erratic wrist motion
-    coords = [(x, y) for x, y, _ in history]
-    if len(coords) >= 2:
-        displacements = [
-            np.hypot(coords[i][0] - coords[i-1][0], coords[i][1] - coords[i-1][1])
-            for i in range(1, len(coords))
-        ]
-        if np.mean(displacements) > ABNORMAL_MOTION_PX:
-            score += SCORE_ABNORMAL_MOTION
-
-    return min(score, 100)
+    return min(int(score), 100)
 
 
-# ── Main loop ─────────────────────────────────────────────────────────────────
 while True:
     ret, frame = cap.read()
     if not ret:
@@ -116,127 +139,151 @@ while True:
     frame = imutils.resize(frame, width=WIDTH)
     h_frame, w_frame = frame.shape[:2]
 
-    # Init writer on first frame
     if writer is None:
         fourcc = cv2.VideoWriter_fourcc(*"MJPG")
         writer = cv2.VideoWriter(output_path, fourcc, 25, (w_frame, h_frame), True)
 
-    overall_status       = no_detection_status
-    any_shoplifting      = False
+    overall_status  = no_detection_status
+    any_shoplifting = False
+    clean_frame     = frame.copy()
 
-    # ── Step 1: Person detection with YOLO ───────────────────────────────────
-    results  = yolo_model.predict(frame, conf=0.4, verbose=False)
-    boxes    = results[0].boxes
-    cc_data  = np.array(boxes.data) if len(boxes) else np.array([])
+    # ── YOLOv8-Pose: detection + keypoints in one call ───────────────────────
+    results = pose_model.predict(frame, conf=0.4, verbose=False)
+    result  = results[0]
 
-    current_indices = set()
+    # Person boxes
+    new_boxes = result.boxes.xyxy.cpu().numpy().astype("int32") if len(result.boxes) else np.zeros((0, 4), dtype="int32")
 
-    if len(cc_data):
-        xyxy_all = np.array(boxes.xyxy).astype("int32")
+    # Keypoints: shape (N, 17, 3) — x, y, confidence per keypoint per person
+    kps = result.keypoints.data.cpu().numpy() if result.keypoints is not None and len(result.keypoints.data) else None
 
-        for idx, ((x1, y1, x2, y2), det) in enumerate(zip(xyxy_all, cc_data)):
-            conf_det = float(det[4])
-            current_indices.add(idx)
+    # ── IoU tracking ─────────────────────────────────────────────────────────
+    matched, unmatched_new = match_detections(person_states, new_boxes)
 
-            # Init state for new person
-            if idx not in hand_histories:
-                hand_histories[idx]   = deque(maxlen=HAND_HISTORY_FRAMES)
-                reach_counts[idx]     = 0
-                suspicion_scores[idx] = 0
+    for tid in list(person_states.keys()):
+        if tid not in matched:
+            person_states[tid]['missed_frames'] += 1
+            if person_states[tid]['missed_frames'] > TRACK_GRACE_FRAMES:
+                del person_states[tid]
 
-            # ── Step 2: Pose estimation on the person crop ────────────────────
-            pad = 10
-            px1 = max(0, x1 - pad)
-            py1 = max(0, y1 - pad)
-            px2 = min(w_frame, x2 + pad)
-            py2 = min(h_frame, y2 + pad)
-            person_crop = frame[py1:py2, px1:px2]
+    for box_idx in unmatched_new:
+        person_states[next_tid] = {
+            'box':            tuple(new_boxes[box_idx]),
+            'left':           deque(maxlen=HAND_HISTORY_FRAMES),
+            'right':          deque(maxlen=HAND_HISTORY_FRAMES),
+            'reach_entries':  0,
+            'frame_count':    0,
+            'missed_frames':  0,
+            'snapshot_taken': False,
+            'dwell_left':     0,
+            'dwell_right':    0,
+        }
+        matched[next_tid] = box_idx
+        next_tid += 1
 
-            wrist_zone = "unknown"
-            wrist_px, wrist_py = None, None
+    # ── Per-person scoring ────────────────────────────────────────────────────
+    for tid, box_idx in matched.items():
+        x1, y1, x2, y2 = new_boxes[box_idx]
+        state = person_states[tid]
+        state['box']           = (x1, y1, x2, y2)
+        state['missed_frames'] = 0
+        state['frame_count']  += 1
+        box_h = max(y2 - y1, 1)
+        conf_det = float(result.boxes.conf[box_idx].cpu())
 
-            if person_crop.size > 0:
-                rgb_crop   = cv2.cvtColor(person_crop, cv2.COLOR_BGR2RGB)
-                pose_result = pose_model.process(rgb_crop)
+        # ── Keypoint extraction ───────────────────────────────────────────────
+        if kps is not None and box_idx < len(kps):
+            person_kps = kps[box_idx]  # shape (17, 3)
 
-                if pose_result.pose_landmarks:
-                    lm = pose_result.pose_landmarks.landmark
-                    crop_h, crop_w = person_crop.shape[:2]
-
-                    # Use the wrist with higher visibility (more likely to be active hand)
-                    lw = lm[mp_pose.PoseLandmark.LEFT_WRIST]
-                    rw = lm[mp_pose.PoseLandmark.RIGHT_WRIST]
-                    wrist = lw if lw.visibility >= rw.visibility else rw
-
-                    # Convert to frame-absolute pixel coords
-                    wrist_px = int(px1 + wrist.x * crop_w)
-                    wrist_py = int(py1 + wrist.y * crop_h)
-
-                    # Get body-relative zone
-                    wrist_zone = get_zone(wrist_py, y1, y2)
-
-                    # Track reach events
-                    if wrist_zone == "reach":
-                        reach_counts[idx] += 1
-
-                    hand_histories[idx].append((wrist_px, wrist_py, wrist_zone))
-
-                    # Draw pose skeleton on frame
-                    mp_drawing.draw_landmarks(
-                        frame[py1:py2, px1:px2],
-                        pose_result.pose_landmarks,
-                        mp_pose.POSE_CONNECTIONS,
-                        landmark_drawing_spec=mp_drawing.DrawingSpec(color=(0, 255, 0), thickness=1, circle_radius=2),
-                        connection_drawing_spec=mp_drawing.DrawingSpec(color=(255, 255, 0), thickness=1)
-                    )
-
-            # ── Step 3: Compute suspicion score ───────────────────────────────
-            score = compute_suspicion(hand_histories[idx], reach_counts[idx])
-            suspicion_scores[idx] = score
-            is_suspicious = score >= ALERT_SCORE_THRESHOLD
-
-            # ── Step 4: Draw bounding box and overlays ────────────────────────
-            box_color = cls1_rect_color if is_suspicious else cls0_rect_color
-            cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
-
-            # Confidence + score label
-            label = f"{conf_det*100:.1f}%  score:{score}"
-            cv2.putText(frame, label, (x1 + 5, y1 - 8),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, conf_color, 1)
-
-            # Zone label near wrist
-            if wrist_px is not None:
-                cv2.circle(frame, (wrist_px, wrist_py), 5, (0, 0, 255), -1)
-                cv2.putText(frame, wrist_zone, (wrist_px + 6, wrist_py),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1)
-
-            # Draw zone guide lines on person box
-            for ratio, color in [
-                (REACH_ZONE_TOP,   (200, 200, 0)),
-                (REACH_ZONE_BOT,   (0, 200, 200)),
-                (CONCEAL_ZONE_BOT, (0, 100, 255)),
+            for kp_idx, hist_key, dwell_key in [
+                (KP_LEFT_WRIST,  'left',  'dwell_left'),
+                (KP_RIGHT_WRIST, 'right', 'dwell_right'),
             ]:
-                line_y = int(y1 + ratio * (y2 - y1))
-                cv2.line(frame, (x1, line_y), (x2, line_y), color, 1)
+                kp = person_kps[kp_idx]
+                wx, wy, conf_kp = float(kp[0]), float(kp[1]), float(kp[2])
 
-            if is_suspicious:
-                any_shoplifting = True
-                overall_status  = shoplifting_status
-            elif overall_status == no_detection_status:
-                overall_status = not_shoplifting_status
+                if conf_kp < VISIBILITY_THRESH:
+                    state[dwell_key] = 0
+                    continue
 
-    # Prune state for persons no longer in frame
-    for old_idx in list(hand_histories.keys()):
-        if old_idx not in current_indices:
-            del hand_histories[old_idx]
-            del reach_counts[old_idx]
-            del suspicion_scores[old_idx]
+                wx, wy = int(wx), int(wy)
+                zone = get_zone(wy, y1, y2)
+                state[hist_key].append((wx, wy, zone))
 
-    # ── Step 5: Draw global status bar ───────────────────────────────────────
-    status_color = status_color_bad if any_shoplifting else status_color_ok
+                # Debounced reach entry
+                if zone == "reach":
+                    state[dwell_key] += 1
+                    if state[dwell_key] == REACH_DWELL_FRAMES:
+                        state['reach_entries'] += 1
+                else:
+                    state[dwell_key] = 0
+
+                # Draw wrist dot + zone label
+                dot_color = (0, 255, 0) if hist_key == 'left' else (255, 100, 0)
+                cv2.circle(frame, (wx, wy), 6, dot_color, -1)
+                cv2.putText(frame, zone, (wx + 7, wy),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 255), 1)
+
+            # Draw elbow-wrist lines
+            for w_idx, e_idx, color in [
+                (KP_LEFT_WRIST,  KP_LEFT_ELBOW,  (0, 255, 0)),
+                (KP_RIGHT_WRIST, KP_RIGHT_ELBOW, (255, 100, 0)),
+            ]:
+                wkp = person_kps[w_idx]; ekp = person_kps[e_idx]
+                if wkp[2] >= VISIBILITY_THRESH and ekp[2] >= VISIBILITY_THRESH:
+                    cv2.line(frame,
+                             (int(wkp[0]), int(wkp[1])),
+                             (int(ekp[0]), int(ekp[1])), color, 2)
+
+        # ── Score ─────────────────────────────────────────────────────────────
+        score         = compute_suspicion(state['left'], state['right'],
+                                          state['reach_entries'], box_h)
+        is_suspicious = score >= ALERT_SCORE_THRESHOLD
+
+        if state['frame_count'] % 15 == 0:
+            print(f"[INFO] tid={tid}  score={score}")
+
+        box_color = cls1_rect_color if is_suspicious else cls0_rect_color
+        cv2.rectangle(frame, (x1, y1), (x2, y2), box_color, 2)
+        cv2.putText(frame, f"{conf_det*100:.1f}%  score:{score}",
+                    (x1 + 5, y1 - 8), cv2.FONT_HERSHEY_SIMPLEX, 0.45, conf_color, 1)
+
+        for ratio, lc in [(REACH_ZONE_TOP,  (200, 200, 0)),
+                          (REACH_ZONE_BOT,   (0, 200, 200)),
+                          (CONCEAL_ZONE_BOT, (0, 100, 255))]:
+            ly = int(y1 + ratio * (y2 - y1))
+            cv2.line(frame, (x1, ly), (x2, ly), lc, 1)
+
+        if is_suspicious:
+            if not state['snapshot_taken']:
+                state['snapshot_taken'] = True
+                ts  = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+                cx1 = max(0, x1-10); cy1 = max(0, y1-10)
+                cx2 = min(w_frame, x2+10); cy2 = min(h_frame, y2+10)
+                snap = clean_frame[cy1:cy2, cx1:cx2].copy()
+                cv2.rectangle(snap, (10, 10),
+                              (snap.shape[1]-10, snap.shape[0]-10), (0, 0, 255), 3)
+                cv2.putText(snap, "SHOPLIFTER",
+                            (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2)
+                cv2.putText(snap, f"Score:{score}  {ts}",
+                            (12, snap.shape[0]-10),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1)
+                snap_path = os.path.join(SNAPSHOT_DIR, f"shoplifter_tid{tid}_{ts}.jpg")
+                cv2.imwrite(snap_path, snap)
+                print(f"[ALERT] Snapshot saved: {snap_path}")
+                play_alarm()
+                send_whatsapp_alert(snap_path, score, tid)
+
+            any_shoplifting = True
+            overall_status  = shoplifting_status
+        elif overall_status == no_detection_status:
+            overall_status = not_shoplifting_status
+
+    # ── Status bar ────────────────────────────────────────────────────────────
+    sc = status_color_bad if any_shoplifting else status_color_ok
     cv2.rectangle(frame, (0, 0), (w_frame, 28), (0, 0, 0), -1)
     cv2.putText(frame, overall_status, (8, 20),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.65, status_color, 2)
+                cv2.FONT_HERSHEY_SIMPLEX, 0.65, sc, 2)
 
     cv2.imshow(frame_name, frame)
     writer.write(frame)
@@ -244,9 +291,7 @@ while True:
     if cv2.waitKey(1) & 0xFF == ord(quit_key):
         break
 
-# ── Cleanup ───────────────────────────────────────────────────────────────────
 cap.release()
-pose_model.close()
 if writer is not None:
     writer.release()
 cv2.destroyAllWindows()
